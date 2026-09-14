@@ -16,7 +16,20 @@ SoundPilot **不直接与音箱通信**，需要搭配小爱音箱语音通知�
 
 ## 测试与构建
 
-GitHub Actions `Windows test build`：前端测试、Rust 单元测试、Tauri Windows x64 构建、Windows 原生窗口启动检查。构建产物仅 Actions artifact，不发布 Release。
+GitHub Actions `Windows build` 两个通道：
+
+| 触发 | 行为 |
+|---|---|
+| push `main` / 手动触发 | 前端测试、Rust 单元测试、Tauri Windows x64 构建、原生窗口启动检查；产物为临时 artifact（7 天） |
+| 推 Tag `v*` | 同上全部检查，另加**版本一致性门禁**（Tag 必须与 package.json / Cargo.toml / tauri.conf.json 一致），通过后自动发布 GitHub Release 并附带可分发 zip |
+
+正式版发布命令：
+
+```bash
+git tag v1.0.0 && git push origin v1.0.0
+```
+
+Release 附件内容：`soundpilot.exe`、使用说明、配置示例、界面截图（**不含**含 Token 的本机配置）。
 
 ## 配置安全
 

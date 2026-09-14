@@ -1,6 +1,6 @@
 [package]
 name = "soundpilot"
-version = "0.1.0"
+version = "1.0.0"
 description = "小爱音量助手 - 游戏时自动调低小爱音箱音量"
 authors = ["SoundPilot"]
 edition = "2021"

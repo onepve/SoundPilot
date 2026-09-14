@@ -1,13 +1,20 @@
-name: Windows test build
+name: Windows build
+
+# 通道约定：
+#   push main / 手动触发 → 仅编译校验 + 测试产物（临时 artifact，7 天）
+#   推 Tag v*            → 正式构建 + 发布 GitHub Release（附可分发 zip）
 on:
   workflow_dispatch:
   push:
     branches: [main]
+    tags: ['v*']
+
 permissions:
-  contents: read
+  contents: write # 打 Tag 时创建 Release 需要
   # upload-artifact v4 在 FinalizeArtifact 阶段需要 actions:write，
   # 否则收紧为 content:read 后会报 403 Forbidden（数据已传完仍判定失败）
   actions: write
+
 jobs:
   windows:
     runs-on: windows-latest
@@ -29,6 +36,23 @@ jobs:
       - name: Native startup smoke test
         shell: pwsh
         run: ./scripts/windows-smoke.ps1
+
+      # Tag 与版本号必须一致，杜绝「标签与程序版本不符」
+      - name: Verify tag matches version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME#v}"
+          CARGO_VER=$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          PKG_VER=$(node -p "require('./package.json').version")
+          CONF_VER=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          echo "tag=$GITHUB_REF_NAME cargo=$CARGO_VER package=$PKG_VER tauri=$CONF_VER"
+          for v in "$CARGO_VER" "$PKG_VER" "$CONF_VER"; do
+            [ "$v" = "$VER" ] || { echo "::error::版本号不一致：tag=$VER 但配置为 $v"; exit 1; }
+          done
+          echo "版本一致：$VER"
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -38,6 +62,33 @@ jobs:
             test-output/*
           if-no-files-found: error
           retention-days: 7
+
+      # 正式发布：打 Tag 时产出可分发 zip 并建 Release
+      # 注意：仅打包 EXE 与文档/示例，绝不包含含 Token 的本机配置
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $stage = "stage-release"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item "src-tauri/target/release/soundpilot.exe" "$stage/"
+          Copy-Item "deliverables/使用说明.md" "$stage/使用说明.md"
+          Copy-Item "config.example.json" "$stage/配置示例.json"
+          if (Test-Path "test-output/windows-startup.png") {
+            Copy-Item "test-output/windows-startup.png" "$stage/界面截图.png"
+          }
+          Get-ChildItem $stage | Select-Object Name, Length | Format-Table
+          $zip = "SoundPilot-Windows-x64-$tag.zip"
+          Compress-Archive -Path "$stage/*" -DestinationPath $zip -Force
+          if (gh release view $tag 2>$null) {
+            gh release upload $tag $zip --clobber
+          } else {
+            gh release create $tag $zip --title "小爱音量助手 $tag" --generate-notes
+          }
+          gh release view $tag --json tagName,isDraft,url,assets --jq '{tag:.tagName, draft:.isDraft, url:.url, assets:[.assets[].name]}'
 
       # 全生命周期自动清理：只保留本次运行，历史旧产物/缓存/运行记录一律物理删除，
       # 避免仓库积压、占满 Actions 存储配额（含失败与取消的运行也必须清）。
@@ -71,7 +122,7 @@ jobs:
                 && echo "  cache $id 已删除" || echo "  cache $id 删除失败"
             done
 
-          # 3) 运行记录：删除历史旧运行（保留本次）
+          # 3) 运行记录：删除历史旧运行（保留本次；Release 与 Tag 不受影响）
           gh run list --repo "$REPO" --limit 100 --json databaseId \
             --jq ".[] | select(.databaseId != ($KEEP_RUN | tonumber)) | .databaseId" |
             while read -r id; do
@@ -82,5 +133,6 @@ jobs:
 
           echo "清理后：产物 $(gh api "repos/$REPO/actions/artifacts" --jq '.total_count') 个 / 缓存 $(gh api "repos/$REPO/actions/caches" --jq '.total_count') 个 / 运行 $(gh run list --repo "$REPO" --limit 100 --json databaseId --jq 'length') 条"
 
-# 说明：清理一律放在 job 最后并带 if: always()，
-# 无论构建成功、失败还是被取消，都不会在仓库里留下历史旧记录。
+# 说明：
+# - 清理一律放在 job 最后并带 if: always()，无论成功、失败还是取消都不留历史旧记录。
+# - Release 资产与 Tag 不由清理步骤删除，需要可回退的历史版本就在 Release 里。
