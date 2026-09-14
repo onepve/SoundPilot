@@ -86,7 +86,8 @@ jobs:
           if (gh release view $tag 2>$null) {
             gh release upload $tag $zip --clobber
           } else {
-            gh release create $tag $zip --title "小爱音量助手 $tag" --generate-notes
+            # 说明直接取自 tag 注释（打 tag 时用 -m 写清楚，Release 页即可读）
+            gh release create $tag $zip --title "小爱音量助手 $tag" --notes-from-tag
           }
           gh release view $tag --json tagName,isDraft,url,assets --jq '{tag:.tagName, draft:.isDraft, url:.url, assets:[.assets[].name]}'
 
