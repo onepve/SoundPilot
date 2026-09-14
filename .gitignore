@@ -1,0 +1,14 @@
+node_modules/
+dist/
+src-tauri/target/
+test-output/
+playwright-report/
+*.log
+soundpilot.json
+config.ini
+.env
+.env.*
+*.zip
+*.7z
+qa-artifacts/
+release/

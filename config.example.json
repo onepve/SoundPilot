@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "serverUrl": "https://your-xiaoi-server.example.com",
+  "token": "",
+  "speakers": [
+    {
+      "did": "1234567890",
+      "name": "客厅音箱",
+      "enabled": true
+    }
+  ],
+  "normalVolume": 30,
+  "matchMode": "order",
+  "restoreMode": "normal",
+  "checkInterval": 5,
+  "exitDebounce": 10,
+  "startPaused": false,
+  "autoStart": false,
+  "rules": [
+    {
+      "id": "rule-game-example",
+      "name": "示例游戏规则",
+      "kind": "game",
+      "enabled": false,
+      "volume": 15,
+      "processes": [
+        { "name": "game.exe" },
+        { "name": "steam.exe", "path": "C:\\Program Files (x86)\\Steam\\steam.exe" }
+      ]
+    },
+    {
+      "id": "rule-platform-example",
+      "name": "示例平台规则",
+      "kind": "platform",
+      "enabled": false,
+      "volume": 25,
+      "processes": [
+        { "name": "steam.exe" }
+      ]
+    }
+  ]
+}

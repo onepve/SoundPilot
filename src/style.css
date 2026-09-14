@@ -1,0 +1,82 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 全局基础 */
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  @apply bg-slate-100 text-slate-800 antialiased;
+  font-family:
+    'Segoe UI',
+    system-ui,
+    -apple-system,
+    'PingFang SC',
+    'Microsoft YaHei UI',
+    'Microsoft YaHei',
+    sans-serif;
+  overflow: hidden;
+}
+
+/* 自定义滚动条（WebView2 支持良好） */
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  @apply rounded-full bg-slate-300;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  @apply bg-slate-400;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 薄荷绿滑块 */
+.slider-mint {
+  @apply h-1.5 cursor-pointer appearance-none rounded-full bg-slate-200;
+}
+.slider-mint::-webkit-slider-thumb {
+  @apply h-4 w-4 appearance-none rounded-full bg-mint-500 shadow;
+  border: 2px solid #fff;
+  transition: transform 0.1s;
+}
+.slider-mint::-webkit-slider-thumb:hover {
+  transform: scale(1.15);
+}
+.slider-mint:disabled::-webkit-slider-thumb {
+  @apply bg-slate-300;
+}
+.slider-mint:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 4px rgba(34, 181, 115, 0.25);
+}
+
+/* 数字输入框去箭头拥挤 */
+input[type='number']::-webkit-outer-spin-button,
+input[type='number']::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+/* 视图切换过渡 */
+.fade-slide-enter-active,
+.fade-slide-leave-active {
+  transition:
+    opacity 0.14s ease,
+    transform 0.14s ease;
+}
+.fade-slide-enter-from {
+  opacity: 0;
+  transform: translateY(6px);
+}
+.fade-slide-leave-to {
+  opacity: 0;
+  transform: translateY(-4px);
+}

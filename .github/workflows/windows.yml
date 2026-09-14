@@ -1,0 +1,40 @@
+name: Windows test build
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+  # upload-artifact v4 在 FinalizeArtifact 阶段需要 actions:write，
+  # 否则收紧为 content:read 后会报 403 Forbidden（数据已传完仍判定失败）
+  actions: write
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Frontend tests
+        run: npm test
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Build Windows executable
+        run: npm run tauri -- build --no-bundle
+      - name: Native startup smoke test
+        shell: pwsh
+        run: ./scripts/windows-smoke.ps1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: SoundPilot-Windows-x64-test
+          path: |
+            src-tauri/target/release/soundpilot.exe
+            test-output/*
+          if-no-files-found: error
+          retention-days: 7
