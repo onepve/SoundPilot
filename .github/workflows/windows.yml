@@ -38,3 +38,49 @@ jobs:
             test-output/*
           if-no-files-found: error
           retention-days: 7
+
+      # 全生命周期自动清理：只保留本次运行，历史旧产物/缓存/运行记录一律物理删除，
+      # 避免仓库积压、占满 Actions 存储配额（含失败与取消的运行也必须清）。
+      - name: Cleanup old runs, artifacts and caches
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          KEEP_RUN: ${{ github.run_id }}
+        run: |
+          set -uo pipefail
+
+          echo "保留本次运行 $KEEP_RUN，清理其余记录"
+
+          # 1) 构建产物：删除非本次运行的全部产物
+          gh api "repos/$REPO/actions/artifacts?per_page=100" --paginate \
+            --jq ".artifacts[] | select(.workflow_run.id != ($KEEP_RUN | tonumber)) | .id" |
+            while read -r id; do
+              [ -z "$id" ] && continue
+              gh api -X DELETE "repos/$REPO/actions/artifacts/$id" >/dev/null 2>&1 \
+                && echo "  artifact $id 已删除" || echo "  artifact $id 删除失败"
+            done
+
+          # 2) Actions 缓存：全部清空
+          gh api "repos/$REPO/actions/caches?per_page=100" --paginate \
+            --jq '.actions_caches[].id' |
+            while read -r id; do
+              [ -z "$id" ] && continue
+              gh api -X DELETE "repos/$REPO/actions/caches/$id" >/dev/null 2>&1 \
+                && echo "  cache $id 已删除" || echo "  cache $id 删除失败"
+            done
+
+          # 3) 运行记录：删除历史旧运行（保留本次）
+          gh run list --repo "$REPO" --limit 100 --json databaseId \
+            --jq ".[] | select(.databaseId != ($KEEP_RUN | tonumber)) | .databaseId" |
+            while read -r id; do
+              [ -z "$id" ] && continue
+              gh api -X DELETE "repos/$REPO/actions/runs/$id" >/dev/null 2>&1 \
+                && echo "  run $id 已删除" || echo "  run $id 删除失败"
+            done
+
+          echo "清理后：产物 $(gh api "repos/$REPO/actions/artifacts" --jq '.total_count') 个 / 缓存 $(gh api "repos/$REPO/actions/caches" --jq '.total_count') 个 / 运行 $(gh run list --repo "$REPO" --limit 100 --json databaseId --jq 'length') 条"
+
+# 说明：清理一律放在 job 最后并带 if: always()，
+# 无论构建成功、失败还是被取消，都不会在仓库里留下历史旧记录。
