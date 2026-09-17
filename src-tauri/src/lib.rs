@@ -21,7 +21,7 @@ use crate::state::AppState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         // 单实例插件必须是第一个注册的插件（官方要求）
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             // 第二个实例：唤起已有主窗口
@@ -104,8 +104,32 @@ pub fn run() {
             cmd::clear_logs,
             cmd::quit_app,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    // 事件循环结束前（RunEvent::Exit 在 tao process::exit 之前触发）统一收尾：
+    // 托盘「退出」、quit_app、系统关机（WM_ENDSESSION）三路都汇聚到这一处，
+    // 在这里等 actor 完成音量恢复，覆盖全部退出路径。
+    let exit_code = app.run_return(|app, event| {
+        if let tauri::RunEvent::Exit = event {
+            restore_volumes_before_exit(app);
+        }
+    });
+    std::process::exit(exit_code);
+}
+
+/// 退出收尾：标记 shutdown（拦在途写）→ actor 入队恢复（FIFO 尾部执行）→ 等完成。
+/// 幂等：重复调用安全（Restore 入队失败即返回）。
+fn restore_volumes_before_exit(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(state) = app.try_state::<Arc<AppState>>() {
+        if !state.is_shutting_down() {
+            state.begin_shutdown();
+        }
+    }
+    if let Some(m) = app.try_state::<monitor::MonitorHandle>() {
+        m.restore_and_wait(std::time::Duration::from_secs(3));
+    }
 }
 
 /// 开机自启注册时附加的启动参数：带此参数启动表示「静默驻留托盘」。
@@ -157,9 +181,6 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
                 if let Some(state) = app.try_state::<Arc<AppState>>() {
                     state.begin_shutdown();
                 }
-                if let Some(m) = app.try_state::<monitor::MonitorHandle>() {
-                    m.stop();
-                }
                 app.exit(0);
             }
             _ => {}
@@ -187,13 +208,11 @@ fn show_main(app: &tauri::AppHandle) {
     }
 }
 
-/// 退出前清理：标记 shutdown（使在途写失效）并停掉 actor。
+/// 退出前清理：仅标记 shutdown（使在途写失效）。
+/// 音量恢复由 RunEvent::Exit 统一执行（quit_app → app.exit → Exit 事件）。
 fn request_quit(app: &tauri::AppHandle) {
     if let Some(state) = app.try_state::<Arc<AppState>>() {
         state.begin_shutdown();
-    }
-    if let Some(m) = app.try_state::<monitor::MonitorHandle>() {
-        m.stop();
     }
 }
 

@@ -35,6 +35,10 @@ pub enum MonitorMsg {
         volume: u8,
         reply: oneshot::Sender<Result<Status, String>>,
     },
+    /// 退出前恢复音量（免 generation/暂停/shutdown 拦截；done 用于同步等待恢复完成）
+    Restore {
+        done: std::sync::mpsc::Sender<()>,
+    },
     /// 停止 actor（退出）
     Stop,
 }
@@ -96,6 +100,21 @@ impl MonitorHandle {
         let _ = self.tx.send(MonitorMsg::Stop);
     }
 
+    /// 退出恢复：入队 Restore（FIFO 排在在途写之后）并等待恢复完成。
+    /// actor 已停止时立即返回（无事可做）。
+    /// 用 std 通道同步等待——tokio 上下文内 block_on 会 panic，std recv 任何线程都安全。
+    pub fn restore_and_wait(&self, timeout: Duration) {
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        if self
+            .tx
+            .send(MonitorMsg::Restore { done: done_tx })
+            .is_err()
+        {
+            return; // actor 已退出，无恢复必要
+        }
+        let _ = done_rx.recv_timeout(timeout);
+    }
+
     /// 测试专用：直接访问 actor 通道。
     #[cfg(test)]
     pub(crate) fn sender_for_test(&self) -> &mpsc::UnboundedSender<MonitorMsg> {
@@ -135,10 +154,19 @@ async fn actor_loop(
 ) {
     while let Some(msg) = rx.recv().await {
         if state.is_shutting_down() {
+            // 关停中只处理恢复请求，其余全部丢弃（防在途写闯关）
+            if let MonitorMsg::Restore { done } = msg {
+                restore_on_exit(&state).await;
+                let _ = done.send(());
+            }
             break;
         }
         match msg {
             MonitorMsg::Stop => break,
+            MonitorMsg::Restore { done } => {
+                restore_on_exit(&state).await;
+                let _ = done.send(());
+            }
             MonitorMsg::CheckNow => {
                 if !state.is_paused() {
                     let snap: &(dyn Fn() -> Vec<ProcessEntry> + Sync) = snapshotter.as_ref();
@@ -251,6 +279,36 @@ async fn apply_volume(state: &Arc<AppState>, did: &str, volume: u8, reason: &str
                 "warn",
                 &format!("{reason}: {did} 核验音量 {actual} != 目标 {volume}"),
             );
+        }
+    }
+}
+
+/// 退出/关机前的音量恢复（仅 actor 调用）：
+/// 仅当有规则生效时才写；恢复语义与规则退出一致（RestoreMode）。
+/// 使用短超时零重试客户端——退出路径不能被慢网络拖住。
+async fn restore_on_exit(state: &Arc<AppState>) {
+    let (rule_id, _, _) = state.active_rule.lock().unwrap().clone();
+    if rule_id.is_none() {
+        return; // 无规则生效，音箱本来就是用户音量，不动
+    }
+    let cfg = state.config().read().unwrap().clone();
+    for s in cfg.speakers.iter().filter(|s| s.enabled) {
+        let target = match cfg.restore_mode {
+            crate::config::RestoreMode::Normal => Some(cfg.normal_volume),
+            crate::config::RestoreMode::Previous => state.baseline(&s.did),
+            crate::config::RestoreMode::None => None,
+        };
+        let Some(volume) = target else { continue };
+        let client = crate::http_client::SpeakerClient::with_options(
+            &cfg.server_url,
+            &cfg.token,
+            Duration::from_secs(1),
+            0,
+            Duration::from_millis(0),
+        );
+        match client.set_volume(&s.did, volume).await {
+            Ok(v) => state.log_event("info", &format!("退出恢复: {} 音量已设为 {v}", s.name)),
+            Err(e) => state.log_event("error", &format!("退出恢复: {} 写入失败: {e}", s.name)),
         }
     }
 }
@@ -590,5 +648,127 @@ mod tests {
             .await
             .expect_err("旧代数手动任务必须被拒绝");
         assert!(err.contains("失效"), "{err}");
+    }
+
+    /// 退出恢复（Normal 模式）：规则生效时 Stop 前恢复 normalVolume，走真实 HTTP。
+    #[tokio::test]
+    async fn exit_restore_writes_normal_volume_via_mock_http() {
+        use crate::http_client::mock_server::{MockAction, MockServer};
+
+        let server = MockServer::start(vec![MockAction::Respond(
+            200,
+            r#"{"success":true,"volume":40,"result":"ok"}"#.into(),
+        )])
+        .await;
+
+        let mut cfg = mk_config(vec![game_rule()], RestoreMode::Normal);
+        cfg.server_url = server.url();
+        cfg.token = "exit-restore-token".into();
+        let state = Arc::new(AppState::new(cfg));
+        state.resume_monitor();
+
+        // 模拟规则生效：命中游戏规则（会写 15）
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run_check(&state, &|| vec![entry("game.exe")], &tx).await;
+        let _ = rx.try_recv(); // 消费掉规则写入（不入队执行）
+        assert!(state.active_rule.lock().unwrap().0.is_some(), "规则应已生效");
+
+        // 退出恢复：应写 normalVolume=40
+        restore_on_exit(&state).await;
+        let reqs = server.recorded();
+        assert_eq!(reqs.len(), 1, "退出恢复应恰好发一次写: {:?}", reqs);
+        assert!(reqs[0].body.contains(r#""volume":40"#), "{}", reqs[0].body);
+        assert_eq!(reqs[0].token_header.as_deref(), Some("exit-restore-token"));
+    }
+
+    /// 退出恢复（Previous 模式）：恢复启动备份的原音量。
+    #[tokio::test]
+    async fn exit_restore_uses_baseline_in_previous_mode() {
+        use crate::http_client::mock_server::{MockAction, MockServer};
+
+        let server = MockServer::start(vec![MockAction::Respond(
+            200,
+            r#"{"success":true,"volume":55,"result":"ok"}"#.into(),
+        )])
+        .await;
+
+        let mut cfg = mk_config(vec![game_rule()], RestoreMode::Previous);
+        cfg.server_url = server.url();
+        let state = Arc::new(AppState::new(cfg));
+        state.set_baseline("d1", 55);
+        state.resume_monitor();
+        state.set_active_rule(Some("g1".into()), Some("游戏".into()), Some(15));
+
+        restore_on_exit(&state).await;
+        let reqs = server.recorded();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].body.contains(r#""volume":55"#), "{}", reqs[0].body);
+    }
+
+    /// 退出恢复：无规则生效时不发任何写（音箱本来就是用户音量）。
+    #[tokio::test]
+    async fn exit_restore_skips_when_no_rule_active() {
+        use crate::http_client::mock_server::{MockAction, MockServer};
+
+        let server = MockServer::start(vec![MockAction::Respond(
+            200,
+            r#"{"success":true,"volume":40,"result":"ok"}"#.into(),
+        )])
+        .await;
+
+        let mut cfg = mk_config(vec![game_rule()], RestoreMode::Normal);
+        cfg.server_url = server.url();
+        let state = Arc::new(AppState::new(cfg));
+        state.resume_monitor();
+        assert!(state.active_rule.lock().unwrap().0.is_none());
+
+        restore_on_exit(&state).await;
+        assert!(server.recorded().is_empty(), "无规则不得发写请求");
+    }
+
+    /// Restore 消息穿透 shutdown 闸门：begin_shutdown 后 Restore 仍被执行（关键回归）。
+    #[tokio::test]
+    async fn restore_message_works_after_begin_shutdown() {
+        use crate::http_client::mock_server::{MockAction, MockServer};
+
+        let server = MockServer::start(vec![MockAction::Respond(
+            200,
+            r#"{"success":true,"volume":40,"result":"ok"}"#.into(),
+        )])
+        .await;
+
+        let mut cfg = mk_config(vec![game_rule()], RestoreMode::Normal);
+        cfg.server_url = server.url();
+        let state = Arc::new(AppState::new(cfg));
+        state.resume_monitor();
+        state.set_active_rule(Some("g1".into()), Some("游戏".into()), Some(15));
+
+        let handle = MonitorHandle::new_with_snapshotter(state.clone(), Arc::new(Vec::new));
+        // 先标记关停（模拟退出路径已开始），Restore 仍必须被执行。
+        // 不能直接调 restore_and_wait：std 阻塞会锁死 #[tokio::test] 单线程运行时，
+        // mock 服务器无法推进；这里用异步轮询等完成，覆盖同一段 actor 逻辑。
+        state.begin_shutdown();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        handle
+            .sender_for_test()
+            .send(MonitorMsg::Restore { done: done_tx })
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while done_rx.try_recv().is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "shutdown 后恢复超时未完成"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let reqs = server.recorded();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "shutdown 后 Restore 必须仍能写恢复音量: {:?}",
+            reqs
+        );
+        assert!(reqs[0].body.contains(r#""volume":40"#), "{}", reqs[0].body);
     }
 }
