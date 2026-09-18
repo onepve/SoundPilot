@@ -6,7 +6,7 @@
 use crate::config::Config;
 use crate::error::AppResult;
 use serde::Serialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -62,6 +62,8 @@ pub struct AppState {
     pub(crate) events: Mutex<VecDeque<StatusEvent>>,
     /// 启动时备份的原音量（restoreMode=previous 用）
     pub(crate) baseline_volumes: Mutex<HashMap<String, u8>>,
+    /// 本次运行中已实际写入成功的音箱；无规则的手动下发退出恢复仅使用此集合。
+    pub(crate) successfully_written_devices: Mutex<HashSet<String>>,
     /// 写代数（暂停/配置变更/手动写都会 bump）
     pub(crate) generation: AtomicU64,
     pub(crate) shutting_down: AtomicBool,
@@ -82,6 +84,7 @@ impl AppState {
             active_rule: Mutex::new((None, None, None)),
             events: Mutex::new(VecDeque::new()),
             baseline_volumes: Mutex::new(HashMap::new()),
+            successfully_written_devices: Mutex::new(HashSet::new()),
             generation: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
             connection: Mutex::new("unknown".into()),
@@ -147,6 +150,18 @@ impl AppState {
     pub fn begin_shutdown(&self) {
         self.bump_generation();
         self.shutting_down.store(true, Ordering::SeqCst);
+    }
+
+    /// 仅在实际 HTTP 写入成功后记录；失败/排队/点击均不得触发退出恢复资格。
+    pub fn record_successful_volume_write(&self, did: &str) {
+        self.successfully_written_devices
+            .lock()
+            .unwrap()
+            .insert(did.to_string());
+    }
+
+    pub fn successfully_written_devices(&self) -> HashSet<String> {
+        self.successfully_written_devices.lock().unwrap().clone()
     }
 
     pub fn is_shutting_down(&self) -> bool {

@@ -234,6 +234,7 @@ async fn manual_volume_impl(
         let client = crate::http_client::SpeakerClient::new(&cfg.server_url, &cfg.token);
         let dev = match client.set_volume(speaker_did, volume).await {
             Ok(v) => {
+                state.record_successful_volume_write(speaker_did);
                 state.log_event("info", &format!("手动设置 {name} 音量为 {v}"));
                 DeviceStatus {
                     did: speaker_did.clone(),
@@ -265,6 +266,7 @@ async fn apply_volume(state: &Arc<AppState>, did: &str, volume: u8, reason: &str
     let client = crate::http_client::SpeakerClient::new(&cfg.server_url, &cfg.token);
     match client.set_volume(did, volume).await {
         Ok(v) => {
+            state.record_successful_volume_write(did);
             state.log_event("info", &format!("{reason}: {did} 音量已设为 {v}"));
         }
         Err(e) => {
@@ -284,15 +286,21 @@ async fn apply_volume(state: &Arc<AppState>, did: &str, volume: u8, reason: &str
 }
 
 /// 退出/关机前的音量恢复（仅 actor 调用）：
-/// 仅当有规则生效时才写；恢复语义与规则退出一致（RestoreMode）。
+/// 有规则时恢复全部启用音箱；仅手动写入时只恢复本次实际写成功的音箱。
+/// 托盘退出、quit_app 与系统关机全部收敛到 RunEvent::Exit，再从这里恢复。
 /// 使用短超时零重试客户端——退出路径不能被慢网络拖住。
 async fn restore_on_exit(state: &Arc<AppState>) {
     let (rule_id, _, _) = state.active_rule.lock().unwrap().clone();
-    if rule_id.is_none() {
-        return; // 无规则生效，音箱本来就是用户音量，不动
+    let written_devices = state.successfully_written_devices();
+    if rule_id.is_none() && written_devices.is_empty() {
+        return; // 无规则且本次未成功写入，音箱本来就是用户音量，不动
     }
     let cfg = state.config().read().unwrap().clone();
     for s in cfg.speakers.iter().filter(|s| s.enabled) {
+        // 规则生效延续既有全量恢复语义；无规则时避免写入未被本次运行改动的设备。
+        if rule_id.is_none() && !written_devices.contains(&s.did) {
+            continue;
+        }
         let target = match cfg.restore_mode {
             crate::config::RestoreMode::Normal => Some(cfg.normal_volume),
             crate::config::RestoreMode::Previous => state.baseline(&s.did),
@@ -633,6 +641,81 @@ mod tests {
         assert!(reqs[0].body.contains(r#""did":"d1""#));
         assert!(reqs[0].body.contains(r#""volume":25"#));
         assert_eq!(reqs[0].token_header.as_deref(), Some("manual-test-token"));
+    }
+
+    /// 手动下发成功后即使没有规则命中，退出也必须恢复该音箱的启动原音量。
+    /// 这是「手动下发 → 退出/关机未恢复」的回归用例。
+    #[tokio::test]
+    async fn exit_restore_restores_successful_manual_write_without_rule() {
+        use crate::http_client::mock_server::{MockAction, MockServer};
+
+        let server = MockServer::start(vec![
+            MockAction::Respond(200, r#"{"success":true,"volume":25,"result":"ok"}"#.into()),
+            MockAction::Respond(200, r#"{"success":true,"volume":55,"result":"ok"}"#.into()),
+        ])
+        .await;
+
+        let mut cfg = mk_config(vec![], RestoreMode::Previous);
+        cfg.speakers.push(Speaker {
+            did: "d2".into(),
+            name: "未手动写入的音箱".into(),
+            enabled: true,
+        });
+        cfg.server_url = server.url();
+        let state = Arc::new(AppState::new(cfg));
+        state.set_baseline("d1", 55);
+        state.set_baseline("d2", 60);
+        let handle = MonitorHandle::new_with_snapshotter(state.clone(), Arc::new(Vec::new));
+
+        // 命令层等价流程：手动下发会暂停监控，但不会产生 active_rule。
+        state.pause_monitor(None);
+        let status = handle
+            .manual_volume(state.current_generation(), 25, Some("d1".to_string()))
+            .await
+            .expect("手动下发必须成功");
+        assert_eq!(status.active_rule_id, None, "手动下发不应伪造规则状态");
+
+        restore_on_exit(&state).await;
+        let reqs = server.recorded();
+        assert_eq!(reqs.len(), 2, "手动写后退出必须额外发起恢复: {reqs:?}");
+        assert!(reqs[1].body.contains(r#""did":"d1""#), "{}", reqs[1].body);
+        assert!(reqs[1].body.contains(r#""volume":55"#), "{}", reqs[1].body);
+        assert!(
+            reqs.iter().all(|req| !req.body.contains(r#""did":"d2""#)),
+            "无规则手动恢复不得写入未实际改动的音箱: {reqs:?}"
+        );
+    }
+
+    /// 失败写入不应取得恢复资格，避免退出时对未成功改动的音箱发送额外请求。
+    #[tokio::test]
+    async fn exit_restore_skips_failed_manual_write_without_rule() {
+        use crate::http_client::mock_server::{MockAction, MockServer};
+
+        let server = MockServer::start(vec![MockAction::Respond(
+            500,
+            r#"{"success":false,"message":"failed"}"#.into(),
+        )])
+        .await;
+
+        let mut cfg = mk_config(vec![], RestoreMode::Previous);
+        cfg.server_url = server.url();
+        let state = Arc::new(AppState::new(cfg));
+        state.set_baseline("d1", 55);
+        let handle = MonitorHandle::new_with_snapshotter(state.clone(), Arc::new(Vec::new));
+
+        state.pause_monitor(None);
+        let status = handle
+            .manual_volume(state.current_generation(), 25, Some("d1".to_string()))
+            .await
+            .expect("失败应通过设备状态返回而非中断 actor");
+        assert!(status.devices[0].error.is_some(), "失败必须反映到设备状态");
+
+        restore_on_exit(&state).await;
+        assert_eq!(
+            server.recorded().len(),
+            1,
+            "失败手动写不得让退出恢复追加请求"
+        );
     }
 
     /// 手动音量带旧代数 → 拒绝执行（防陈旧写同样覆盖手动路径）。
